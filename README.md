@@ -1,54 +1,136 @@
-# Color e-paper Processor
-Code to pre-process images for particular e-paper panels. The resulting image should then be possible to be uploaded onto the color e-paper panel 
+# E-Paper Message Board
 
-# AAAAA Mite Kure
+A message board for homelab multi-agent coordination, displayed on a color e-paper screen via IT8951. AI agents and humans post messages through a REST API; a web dashboard allows viewing and dismissing them from a phone.
 
-Results:
-![Image](img/result.jpg)
+## Features
 
-Source image from [MITE KURE mite kure ᵐⁱᵗᵉ ᵏᵘʳᵉ](https://youtu.be/GlWJCucT96s):
-[Click for image](img/source.jpg)
+- **REST API** — Full CRUD (`POST`/`GET`/`PUT`/`DELETE`) with OpenAPI docs at `/docs`
+- **Color e-paper rendering** — RGB text via ANSI escape codes, rendered through subpixel addressing
+- **Web dashboard** — NiceGUI 3.8.0 UI at `/dashboard` for viewing and dismissing messages
+- **Multi-message display** — Up to 4 messages on screen simultaneously with X/N footer
+- **Self-descriptive** — Plain HTML at `/` links to OpenAPI spec; agents can discover the API autonomously
+- **SQLite persistence** — Messages survive restarts
 
-# A necessary hardware change
+## Hardware
 
-Before making changes to the hardware, certain images if they have too much similar pixels horizontally would fail to display for no reason. 
-[Click to show defect](img/grayscale-fail.jpg)
+- Raspberry Pi (or similar SBC) with SPI enabled
+- IT8951-based e-paper HAT (tested with 9.7" 1448x1072 color panel from [Good Display](https://www.good-display.com/product/365.html))
+- Color panel has RGB subpixel columns in the pattern `RBG / GRB / BGR`
 
-Capacitors were removed from a damaged black-and-white e-paper panel and added to this color e-paper panel, and the issue is fixed. 
+### Panel notes
 
-Procedure:
-1. Use a razor knife to scrape off the solder mask for the pads. Do not scrape too much. 
-2. Desolder the capacitors from the old panel to the new panel
-3. **Check for shorts across the capacitors.** A capacitor connects from signal to ground. The pad for signal lines is surrounded by ground. Shorts are caused because of excessive scraping, leading to a short to ground.
+The `postprocess.py` and `display.py` files are the original standalone scripts for displaying arbitrary images on the color panel. The message board app (`main.py`) incorporates the subpixel interleaving logic directly.
 
-Results:
-![Image](img/capacitors.jpg)
+A hardware modification (adding capacitors from a donor panel) may be needed to prevent display failures with horizontally uniform pixel patterns. See the `img/` folder for reference photos.
 
+## API
 
-## Panel identification
-The panel may go under various names. Key features are:
-- "I80" connector
-- Alternating RGB pixels in the following format:
 ```
-RBGRBGRBG
-GRBGRBGRB
-BGRBGRBGR
+POST   /api/message          Create a message
+GET    /api/messages          List all active messages
+GET    /api/message/{id}      Get a single message
+PUT    /api/message/{id}      Update a message
+DELETE /api/message/{id}      Dismiss a message
+DELETE /api/messages           Dismiss all messages
+GET    /api/frame             Get last rendered frame as PNG
 ```
 
-## Panel sources
-Here are some potential sources:
-https://www.good-display.com/product/89/
+### Message format
 
--> https://www.good-display.com/product/365.html I own it. Tested working so far
+```json
+{
+  "header": "Build Complete",
+  "body": "All containers deployed\nto production cluster"
+}
+```
 
-https://shopkits.eink.com/product-category/color-epaper-modules/
+- **Header**: max 30 visible characters
+- **Body**: max 2 lines, 50 visible characters per line
+- ANSI escape codes (e.g. `\033[31m` for red) are supported and rendered in color on the e-paper. They do not count toward character limits.
 
-## Usage
-Currently this is in early alpha for proof-of-concept and exists as a script which requires user editing. ```tarwidth``` and ```tarheight``` should be edited for other panels, as well as the dithering logic. It depends on ImageMagick "convert.exe" for use in Windows platforms. 
+### Validation
 
-## Todo
-- Code refactoring and variable naming cleanup
-- Make into package
-- Cross-platform calling of ImageMagick
-- Adapting for other panels
-  - If you are in possession of other panels, please try and contact me
+The API strictly rejects messages exceeding limits (returns 400). Callers are responsible for line-breaking.
+
+## Deployment
+
+### Prerequisites
+
+```bash
+# On the SBC, create a venv and install dependencies
+python3 -m venv /opt/epaper-app
+/opt/epaper-app/bin/pip install nicegui==3.8.0 Pillow numpy
+/opt/epaper-app/bin/pip install git+https://github.com/GregDMeyer/IT8951.git
+/opt/epaper-app/bin/pip install RPi.GPIO
+
+# Install the monospace font
+sudo apt-get install -y fonts-dejavu-core
+```
+
+### Install
+
+```bash
+# Copy the app
+cp main.py /opt/epaper-app/main.py
+
+# Install and enable the systemd service
+cp epaper-app.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now epaper-app
+```
+
+### Verify
+
+```bash
+# Post a test message
+curl -X POST http://<IP>:8090/api/message \
+  -H 'Content-Type: application/json' \
+  -d '{"header":"Hello World","body":"First message!"}'
+
+# Open in browser
+# http://<IP>:8090/         — landing page with API links
+# http://<IP>:8090/docs     — Swagger UI
+# http://<IP>:8090/dashboard — web UI
+```
+
+## Architecture
+
+Single Python process running NiceGUI (which wraps FastAPI + Uvicorn):
+
+```
+               ┌──────────────────────────────┐
+               │         main.py               │
+Agents ──POST──▶  FastAPI REST API             │
+               │    │                          │
+               │    ▼                          │
+               │  SQLite ◄── NiceGUI dashboard ◄── Phone browser
+               │    │                          │
+               │    ▼                          │
+               │  Pillow render (RGB)          │
+               │    │                          │
+               │    ▼                          │
+               │  Subpixel interleave (→gray)  │
+               │    │                          │
+               │    ▼                          │
+               │  IT8951 SPI → e-paper panel   │
+               └──────────────────────────────┘
+```
+
+## Color subpixel rendering
+
+The color e-paper panel has physical RGB subpixel columns. To display color, the app:
+
+1. Renders text as a standard RGB image using Pillow
+2. Extracts R, G, B channels and interleaves them to address individual subpixels
+3. Sends the resulting grayscale image to the IT8951 controller
+
+The R/B channels are swapped to account for 180° panel rotation. This technique is adapted from the original `postprocess.py` in this repo.
+
+## Legacy files
+
+| File | Purpose |
+|---|---|
+| `postprocess.py` | Original standalone image-to-subpixel converter |
+| `display.py` | Original standalone image display script |
+| `webserver.py` | Original web interface for uploading images |
+| `img/` | Hardware modification reference photos |

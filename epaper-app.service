@@ -1,0 +1,14 @@
+[Unit]
+Description=E-Paper Message Board
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/epaper-app
+ExecStart=/opt/epaper-app/bin/python /opt/epaper-app/main.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

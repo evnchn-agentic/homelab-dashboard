@@ -1,0 +1,663 @@
+#!/usr/bin/env python3
+"""E-Paper Message Board — NiceGUI + IT8951
+
+Posts messages to an e-paper display via REST API.
+Web UI for viewing and dismissing messages.
+"""
+
+import re
+import sqlite3
+import threading
+import logging
+from datetime import datetime
+from pathlib import Path
+
+import io
+import numpy as np
+from fastapi import Request
+from fastapi.responses import JSONResponse, Response
+from nicegui import app, ui
+from pydantic import BaseModel, Field
+from PIL import Image, ImageDraw, ImageFont
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models for API docs
+# ---------------------------------------------------------------------------
+
+class MessageIn(BaseModel):
+    header: str = Field(..., description="Message header, max 30 visible chars. Supports ANSI color codes (e.g. \\033[31m for red).", max_length=200)
+    body: str = Field("", description="Message body, max 2 lines of 50 visible chars each, separated by \\n. Supports ANSI color codes.", max_length=500)
+
+class MessageOut(BaseModel):
+    id: int
+    header: str
+    body: str
+    created_at: str
+    status: str
+
+class StatusOut(BaseModel):
+    status: str
+
+class ErrorOut(BaseModel):
+    error: str
+
+class CreatedOut(BaseModel):
+    id: int
+    status: str
+
+
+# ---------------------------------------------------------------------------
+# IT8951 import (only available on the actual hardware)
+# ---------------------------------------------------------------------------
+try:
+    from IT8951.display import AutoEPDDisplay
+    from IT8951 import constants
+    EPAPER_AVAILABLE = True
+except ImportError:
+    EPAPER_AVAILABLE = False
+    logging.warning("IT8951 not available — running in headless mode")
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+DB_PATH = Path(__file__).parent / "messages.db"
+DISPLAY_WIDTH = 1448
+DISPLAY_HEIGHT = 1072
+VCOM = -2.00
+SPI_HZ = 24000000
+MARGIN = 30
+FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+HEADER_FONT_SIZE = 77
+BODY_FONT_SIZE = 45
+
+log = logging.getLogger("epaper")
+logging.basicConfig(level=logging.INFO)
+
+_db_lock = threading.Lock()
+_display_lock = threading.Lock()
+_epd = None  # lazily initialised AutoEPDDisplay
+_last_frame: Image.Image | None = None  # last rendered RGB frame
+
+# ---------------------------------------------------------------------------
+# ANSI escape sequence handling
+# ---------------------------------------------------------------------------
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+# Map ANSI color codes to RGB tuples for color e-paper
+_ANSI_RGB = {
+    30: (0, 0, 0),         # black
+    31: (255, 0, 0),       # red
+    32: (0, 255, 0),       # green
+    33: (255, 255, 0),     # yellow
+    34: (0, 0, 255),       # blue
+    35: (255, 0, 255),     # magenta
+    36: (0, 255, 255),     # cyan
+    37: (255, 255, 255),   # white
+    90: (128, 128, 128),   # bright black (gray)
+    91: (255, 80, 80),     # bright red
+    92: (80, 255, 80),     # bright green
+    93: (255, 255, 80),    # bright yellow
+    94: (80, 80, 255),     # bright blue
+    95: (255, 80, 255),    # bright magenta
+    96: (80, 255, 255),    # bright cyan
+    97: (224, 224, 224),   # bright white
+}
+
+
+def strip_ansi(text: str) -> str:
+    """Remove all ANSI escape sequences from text."""
+    return _ANSI_RE.sub("", text)
+
+
+def parse_ansi_segments(text: str) -> list[tuple[str, tuple]]:
+    """Parse text with ANSI codes into [(text, rgb_tuple), ...] segments."""
+    segments = []
+    current_fill = (0, 0, 0)  # default black
+    pos = 0
+    for m in _ANSI_RE.finditer(text):
+        # Text before this escape
+        if m.start() > pos:
+            segments.append((text[pos:m.start()], current_fill))
+        # Parse the escape code
+        codes_str = m.group()[2:-1]  # strip \033[ and m
+        if codes_str:
+            for code in codes_str.split(";"):
+                c = int(code) if code else 0
+                if c == 0:
+                    current_fill = (0, 0, 0)  # reset
+                elif c == 1:
+                    pass  # bold — no-op for now
+                elif c in _ANSI_RGB:
+                    current_fill = _ANSI_RGB[c]
+        pos = m.end()
+    # Remaining text
+    if pos < len(text):
+        segments.append((text[pos:], current_fill))
+    return segments
+
+
+# Map ANSI codes to CSS color names for the web UI
+_ANSI_CSS = {
+    30: "black", 31: "red", 32: "green", 33: "#b8860b", 34: "blue",
+    35: "magenta", 36: "teal", 37: "lightgray",
+    90: "gray", 91: "#ff4444", 92: "#44cc44", 93: "#cccc44",
+    94: "#4444ff", 95: "#ff44ff", 96: "#44cccc", 97: "silver",
+}
+
+
+def ansi_to_html(text: str) -> str:
+    """Convert ANSI-colored text to HTML with <span> color styles."""
+    import html as _html
+    parts = []
+    current_color = None
+    pos = 0
+    for m in _ANSI_RE.finditer(text):
+        if m.start() > pos:
+            chunk = _html.escape(text[pos:m.start()])
+            if current_color:
+                parts.append(f'<span style="color:{current_color}">{chunk}</span>')
+            else:
+                parts.append(chunk)
+        codes_str = m.group()[2:-1]
+        if codes_str:
+            for code in codes_str.split(";"):
+                c = int(code) if code else 0
+                if c == 0:
+                    current_color = None
+                elif c in _ANSI_CSS:
+                    current_color = _ANSI_CSS[c]
+        pos = m.end()
+    if pos < len(text):
+        chunk = _html.escape(text[pos:])
+        if current_color:
+            parts.append(f'<span style="color:{current_color}">{chunk}</span>')
+        else:
+            parts.append(chunk)
+    return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Database helpers
+# ---------------------------------------------------------------------------
+
+def _get_db():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def init_db():
+    with _db_lock:
+        conn = _get_db()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                header      TEXT NOT NULL,
+                body        TEXT NOT NULL DEFAULT '',
+                created_at  TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'queued'
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+
+def add_message(header: str, body: str) -> int:
+    with _db_lock:
+        conn = _get_db()
+        cur = conn.execute(
+            "INSERT INTO messages (header, body, created_at, status) VALUES (?, ?, ?, 'queued')",
+            (header, body, datetime.now().isoformat()),
+        )
+        msg_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+    return msg_id
+
+
+def get_current_message() -> dict | None:
+    """Return the oldest queued message (the one currently displayed)."""
+    with _db_lock:
+        conn = _get_db()
+        row = conn.execute(
+            "SELECT * FROM messages WHERE status='queued' ORDER BY id ASC LIMIT 1"
+        ).fetchone()
+        conn.close()
+    return dict(row) if row else None
+
+
+def get_queued_messages() -> list[dict]:
+    """Return all queued messages (oldest first)."""
+    with _db_lock:
+        conn = _get_db()
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE status='queued' ORDER BY id ASC"
+        ).fetchall()
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_message_by_id(msg_id: int) -> dict | None:
+    with _db_lock:
+        conn = _get_db()
+        row = conn.execute("SELECT * FROM messages WHERE id=?", (msg_id,)).fetchone()
+        conn.close()
+    return dict(row) if row else None
+
+
+def dismiss_message(msg_id: int):
+    with _db_lock:
+        conn = _get_db()
+        conn.execute("UPDATE messages SET status='dismissed' WHERE id=?", (msg_id,))
+        conn.commit()
+        conn.close()
+
+
+def dismiss_all():
+    with _db_lock:
+        conn = _get_db()
+        conn.execute("UPDATE messages SET status='dismissed' WHERE status='queued'")
+        conn.commit()
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# E-Paper rendering
+# ---------------------------------------------------------------------------
+
+def _get_epd():
+    global _epd
+    if _epd is None and EPAPER_AVAILABLE:
+        _epd = AutoEPDDisplay(vcom=VCOM, rotate="flip", mirror=False, spi_hz=SPI_HZ)
+    return _epd
+
+
+FOOTER_FONT_SIZE = 32
+MSG_GAP = 22  # vertical gap between messages
+HEADER_SEP_GAP = 15  # header text to separator line
+SEP_BODY_GAP = 16    # separator line to body text
+BODY_LINE_GAP = 8    # between body lines
+
+
+def _draw_ansi_text(draw: ImageDraw.Draw, x: float, y: float, text: str, font: ImageFont.FreeTypeFont):
+    """Draw text with ANSI color codes as RGB colors."""
+    segments = parse_ansi_segments(text)
+    cx = x
+    for segment_text, fill in segments:
+        draw.text((cx, y), segment_text, font=font, fill=fill)
+        cx += font.getlength(segment_text)
+
+
+def _rgb_to_subpixel(rgb_img: Image.Image) -> Image.Image:
+    """Convert an RGB image to subpixel-addressed grayscale for the color e-paper.
+
+    Adapted from evnchn-utilities/color-e-paper-processor/postprocess.py.
+    The panel has R, B, G subpixel columns — this interleaves the channels
+    to address each subpixel individually.
+    """
+    arr = np.array(rgb_img)  # (H, W, 3)
+    h, w = arr.shape[:2]
+
+    # Quantize to 4-bit color (multiples of 17)
+    arr = np.floor_divide(arr, 17) * 17
+
+    # Extract every 3rd pixel from each channel (subpixel addressing)
+    # Swapped R/B positions to account for 180° panel rotation
+    blues = arr[:, :, 2].reshape(-1)[0::3]
+    greens = arr[:, :, 1].reshape(-1)[2::3]
+    reds = arr[:, :, 0].reshape(-1)[1::3]
+
+    # Pad greens if needed
+    greens = np.pad(greens, (0, blues.size - greens.size), "constant")
+
+    # Stack in rotated subpixel order: B, R, G
+    stacked = np.vstack((blues, reds, greens))
+    interleaved = stacked.T.reshape(-1)
+    interleaved = np.delete(interleaved, -1)
+    result = interleaved.reshape(h, w)
+
+    gray_img = Image.fromarray(np.uint8(result), "L")
+    # 2x upscale then back to original size (helps subpixel blending)
+    gray_img = gray_img.resize((w * 2, h * 2), Image.NEAREST)
+    gray_img = gray_img.resize((w, h), Image.BICUBIC)
+    return gray_img
+
+
+def render_messages(messages: list[dict]):
+    """Draw as many messages as fit, with an X/N footer at the bottom."""
+    img = Image.new("RGB", (DISPLAY_WIDTH, DISPLAY_HEIGHT), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    try:
+        header_font = ImageFont.truetype(FONT_PATH, HEADER_FONT_SIZE)
+        body_font = ImageFont.truetype(FONT_PATH, BODY_FONT_SIZE)
+        footer_font = ImageFont.truetype(FONT_PATH, FOOTER_FONT_SIZE)
+    except OSError:
+        log.warning("Font not found at %s, falling back to default", FONT_PATH)
+        header_font = ImageFont.load_default()
+        body_font = ImageFont.load_default()
+        footer_font = ImageFont.load_default()
+
+    total = len(messages)
+
+    # Reserve space for footer
+    footer_height = FOOTER_FONT_SIZE + MARGIN  # font + bottom margin
+    max_y = DISPLAY_HEIGHT - footer_height
+
+    y = MARGIN
+    shown = 0
+
+    for msg in messages:
+        # Estimate space needed for this message header
+        header_h = HEADER_FONT_SIZE + HEADER_SEP_GAP + 2 + SEP_BODY_GAP if msg["header"] else 0
+        body_lines = msg["body"].split("\n") if msg["body"] else []
+
+        # Check if this message fits (at least the header must fit)
+        if shown > 0 and y + header_h > max_y:
+            break
+
+        # Draw header
+        if msg["header"]:
+            _draw_ansi_text(draw, MARGIN, y, msg["header"], header_font)
+            y += HEADER_FONT_SIZE + HEADER_SEP_GAP
+            draw.line([(MARGIN, y), (DISPLAY_WIDTH - MARGIN, y)], fill=(0, 0, 0), width=2)
+            y += SEP_BODY_GAP
+
+        # Draw body lines — always reserve space for 2 lines
+        BODY_LINES_PER_MSG = 2
+        truncated = False
+        for li, line in enumerate(body_lines):
+            if y + BODY_FONT_SIZE > max_y:
+                truncated = True
+                break
+            _draw_ansi_text(draw, MARGIN, y, line, body_font)
+            y += BODY_FONT_SIZE + BODY_LINE_GAP
+
+        # If body was cut off, overwrite end of last drawn line with "..."
+        if truncated and li > 0:
+            ellipsis = "..."
+            ew = body_font.getlength(ellipsis)
+            ex = DISPLAY_WIDTH - MARGIN - ew
+            ey = y - BODY_FONT_SIZE - BODY_LINE_GAP
+            draw.rectangle([(ex, ey), (DISPLAY_WIDTH - MARGIN, ey + BODY_FONT_SIZE)], fill=(255, 255, 255))
+            draw.text((ex, ey), ellipsis, font=body_font, fill=(0, 0, 0))
+
+        # Advance y to fill 2 body lines regardless of actual count
+        drawn_lines = min(len(body_lines), BODY_LINES_PER_MSG)
+        remaining_lines = BODY_LINES_PER_MSG - drawn_lines
+        y += remaining_lines * (BODY_FONT_SIZE + BODY_LINE_GAP)
+
+        shown += 1
+        y += MSG_GAP  # gap before next message
+
+    # Draw footer
+    footer_text = f"{shown}/{total} messages shown"
+    footer_w = footer_font.getlength(footer_text)
+    footer_x = (DISPLAY_WIDTH - footer_w) / 2  # center
+    footer_y = DISPLAY_HEIGHT - MARGIN - FOOTER_FONT_SIZE
+    draw.text((footer_x, footer_y), footer_text, font=footer_font, fill=(128, 128, 128))
+
+    # Convert RGB to subpixel-addressed grayscale for color e-paper
+    global _last_frame
+    _last_frame = img.copy()
+    _push_to_display(_rgb_to_subpixel(img))
+
+
+def render_idle():
+    """Show a simple idle screen when the queue is empty."""
+    img = Image.new("RGB", (DISPLAY_WIDTH, DISPLAY_HEIGHT), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype(FONT_PATH, 48)
+    except OSError:
+        font = ImageFont.load_default()
+    draw.text((MARGIN, MARGIN), "No messages", font=font, fill=(128, 128, 128))
+    global _last_frame
+    _last_frame = img.copy()
+    _push_to_display(_rgb_to_subpixel(img))
+
+
+def _push_to_display(img: Image.Image):
+    """Send a PIL image to the IT8951 e-paper display."""
+    with _display_lock:
+        epd = _get_epd()
+        if epd is None:
+            log.info("No e-paper display — skipping render")
+            return
+        try:
+            epd.clear()
+            epd.frame_buf.paste(0xFF, box=(0, 0, epd.width, epd.height))
+            epd.frame_buf.paste(img, (0, 0))
+            epd.draw_full(constants.DisplayModes.GC16)
+            log.info("E-paper display updated")
+        except Exception:
+            log.exception("Failed to update e-paper display")
+
+
+def update_display():
+    """Render all queued messages (or idle screen) on the e-paper."""
+    messages = get_queued_messages()
+    if messages:
+        render_messages(messages)
+    else:
+        render_idle()
+
+
+# ---------------------------------------------------------------------------
+# REST API
+# ---------------------------------------------------------------------------
+
+def _validate_message(header: str, body: str) -> str | None:
+    """Return error string if invalid, None if OK."""
+    if not header:
+        return "header is required"
+    visible = len(strip_ansi(header))
+    if visible > 30:
+        return f"header exceeds 30 visible chars (got {visible})"
+    if body:
+        lines = body.split("\n")
+        if len(lines) > 2:
+            return f"body exceeds 2 lines (got {len(lines)})"
+        for i, line in enumerate(lines):
+            vlen = len(strip_ansi(line))
+            if vlen > 50:
+                return f"body line {i+1} exceeds 50 visible chars (got {vlen}). Caller must line-break to fit."
+    return None
+
+
+def _msg_to_json(msg: dict) -> dict:
+    return {"id": msg["id"], "header": msg["header"], "body": msg["body"],
+            "created_at": msg["created_at"], "status": msg["status"]}
+
+
+
+_INDEX_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>E-Paper Message Board</title>
+</head>
+<body>
+<h1>E-Paper Message Board</h1>
+<ul>
+  <li><a href="/openapi.json">API Specification (OpenAPI JSON)</a></li>
+  <li><a href="/docs">Interactive API Documentation (Swagger UI)</a></li>
+  <li><a href="/redoc">API Documentation (ReDoc)</a></li>
+  <li><a href="/dashboard">Dashboard</a></li>
+</ul>
+</body>
+</html>"""
+
+
+@app.get("/", include_in_schema=False)
+async def root():
+    return Response(content=_INDEX_HTML, media_type="text/html")
+
+
+@app.get("/index.html", include_in_schema=False)
+async def index_html():
+    return Response(content=_INDEX_HTML, media_type="text/html")
+
+
+@app.get("/api/messages", response_model=list[MessageOut],
+         summary="List all active messages",
+         description="Returns all queued (non-dismissed) messages, oldest first.")
+async def list_messages():
+    return [_msg_to_json(m) for m in get_queued_messages()]
+
+
+@app.get("/api/message/{msg_id}", response_model=MessageOut,
+         summary="Get a single message",
+         description="Returns a message by ID. Returns 404 if not found.",
+         responses={404: {"model": ErrorOut}})
+async def get_message(msg_id: int):
+    msg = get_message_by_id(msg_id)
+    if not msg:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return _msg_to_json(msg)
+
+
+@app.post("/api/message", response_model=CreatedOut, status_code=201,
+          summary="Create a new message",
+          description="Post a message to the e-paper display. Header max 30 visible chars, "
+                      "body max 2 lines of 50 visible chars. ANSI escape codes (e.g. \\033[31m) "
+                      "are supported for color and do not count toward char limits.",
+          responses={400: {"model": ErrorOut}})
+async def post_message(data: MessageIn):
+    err = _validate_message(data.header, data.body)
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
+
+    msg_id = add_message(data.header, data.body)
+    log.info("Message %d queued: %s", msg_id, strip_ansi(data.header))
+    threading.Thread(target=update_display, daemon=True).start()
+    return JSONResponse({"id": msg_id, "status": "queued"}, status_code=201)
+
+
+@app.put("/api/message/{msg_id}", response_model=MessageOut,
+         summary="Update a message",
+         description="Update the header and/or body of an existing queued message. "
+                     "Omitted fields keep their current value.",
+         responses={400: {"model": ErrorOut}, 404: {"model": ErrorOut}})
+async def update_message(msg_id: int, data: MessageIn):
+    msg = get_message_by_id(msg_id)
+    if not msg or msg["status"] != "queued":
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    header = data.header
+    body = data.body
+
+    err = _validate_message(header, body)
+    if err:
+        return JSONResponse({"error": err}, status_code=400)
+
+    with _db_lock:
+        conn = _get_db()
+        conn.execute("UPDATE messages SET header=?, body=? WHERE id=?", (header, body, msg_id))
+        conn.commit()
+        conn.close()
+
+    log.info("Message %d updated", msg_id)
+    threading.Thread(target=update_display, daemon=True).start()
+    return _msg_to_json(get_message_by_id(msg_id))
+
+
+@app.delete("/api/message/{msg_id}", response_model=StatusOut,
+            summary="Dismiss a message",
+            description="Remove a single message from the display.",
+            responses={404: {"model": ErrorOut}})
+async def delete_message(msg_id: int):
+    msg = get_message_by_id(msg_id)
+    if not msg or msg["status"] != "queued":
+        return JSONResponse({"error": "not found"}, status_code=404)
+    dismiss_message(msg_id)
+    log.info("Message %d dismissed", msg_id)
+    threading.Thread(target=update_display, daemon=True).start()
+    return {"status": "dismissed"}
+
+
+@app.delete("/api/messages", response_model=StatusOut,
+            summary="Dismiss all messages",
+            description="Remove all messages from the display and show the idle screen.")
+async def delete_all_messages():
+    dismiss_all()
+    log.info("All messages dismissed")
+    threading.Thread(target=update_display, daemon=True).start()
+    return {"status": "all dismissed"}
+
+
+@app.get("/api/frame",
+         summary="Get current display frame as PNG",
+         description="Returns the last rendered frame as a PNG image. "
+                     "This is the RGB image before color e-paper subpixel conversion.",
+         responses={200: {"content": {"image/png": {}}}, 404: {"model": ErrorOut}})
+async def get_frame():
+    if _last_frame is None:
+        return JSONResponse({"error": "no frame rendered yet"}, status_code=404)
+    buf = io.BytesIO()
+    _last_frame.save(buf, format="PNG")
+    return Response(content=buf.getvalue(), media_type="image/png")
+
+
+# ---------------------------------------------------------------------------
+# NiceGUI Web UI
+# ---------------------------------------------------------------------------
+
+@ui.page("/dashboard")
+def dashboard():
+    ui.add_head_html('<meta name="viewport" content="width=device-width, initial-scale=1">')
+
+    with ui.column().classes("w-full max-w-2xl mx-auto p-4 gap-4"):
+        ui.label("E-Paper Message Board").classes("text-2xl font-bold")
+        messages_container = ui.column().classes("w-full gap-2")
+
+    def refresh():
+        messages = get_queued_messages()
+
+        messages_container.clear()
+        with messages_container:
+            if not messages:
+                ui.label("No messages").classes("text-gray-400 italic")
+            else:
+                ui.button("Clear All", on_click=do_clear_all).props("color=red")
+                for msg in messages:
+                    with ui.card().classes("w-full"):
+                        with ui.row().classes("w-full items-center justify-between"):
+                            ui.html(f'<span class="text-xl font-bold">{ansi_to_html(msg["header"])}</span>')
+                            ui.button("Dismiss", on_click=lambda mid=msg["id"]: do_dismiss(mid)).props("color=orange dense")
+                        if msg["body"]:
+                            body_html = ansi_to_html(msg["body"]).replace("\n", "<br>")
+                            ui.html(f'<pre style="font-size:0.875rem;white-space:pre-wrap;margin:0">{body_html}</pre>')
+                        ui.label(f"Posted: {msg['created_at']}").classes("text-xs text-gray-400")
+
+    def do_dismiss(msg_id):
+        dismiss_message(msg_id)
+        threading.Thread(target=update_display, daemon=True).start()
+        refresh()
+
+    def do_clear_all():
+        dismiss_all()
+        threading.Thread(target=update_display, daemon=True).start()
+        refresh()
+
+    refresh()
+    ui.timer(5.0, refresh)
+
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+
+def on_startup():
+    init_db()
+    log.info("Database initialised at %s", DB_PATH)
+    log.info("E-paper available: %s", EPAPER_AVAILABLE)
+    # Render whatever is current (or idle)
+    threading.Thread(target=update_display, daemon=True).start()
+
+app.on_startup(on_startup)
+
+ui.run(host="0.0.0.0", port=8090, title="E-Paper Message Board", reload=False,
+       fastapi_docs=True)
