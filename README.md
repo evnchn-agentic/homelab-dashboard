@@ -1,22 +1,28 @@
-# E-Paper Message Board
+# Homelab Dashboard
 
-A message board for homelab multi-agent coordination, displayed on a color e-paper screen via IT8951. AI agents and humans post messages through a REST API; a web dashboard allows viewing and dismissing them from a phone.
+Homelab monitoring dashboard and agent message board, displayed on a 9.7" color e-paper screen via IT8951. AI agents and humans post messages through a REST API; a web dashboard (dark + cyan theme) allows viewing and dismissing them.
 
-![E-Paper Message Board](img/epaper-message-board.jpg)
+> **Looking for the original SPI-based e-paper message board?** See the [last pre-migration commit](https://github.com/evnchn-agentic/homelab-dashboard/tree/22d3de8ad017d7437e60ce548e380581a028b886).
+
+<!-- TODO: new product image -->
+
+> **Avatar:** Place your avatar at `img/avatar.webp` (not tracked in git). It displays full-height on the right side of the dashboard.
 
 ## Features
 
 - **REST API** — Full CRUD (`POST`/`GET`/`PUT`/`DELETE`) with OpenAPI docs at `/docs`
 - **Color highlighting** — ANSI background color codes rendered as highlighted text via subpixel addressing
-- **Web dashboard** — NiceGUI 3.8.0 UI at `/dashboard` for viewing and dismissing messages
+- **Web dashboard** — Dark + cyan themed NiceGUI UI at `/dashboard` with avatar sidebar
+- **USB + SPI support** — USB via [it8951-usb](https://github.com/evnchn-utilities/it8951-usb) (x86/ARM), SPI via [GregDMeyer/IT8951](https://github.com/GregDMeyer/IT8951) (RPi) with automatic fallback
 - **Multi-message display** — Up to 4 messages on screen simultaneously with X/N footer
 - **Self-descriptive** — Plain HTML at `/` links to OpenAPI spec; agents can discover the API autonomously
 - **SQLite persistence** — Messages survive restarts
 
 ## Hardware
 
-- Raspberry Pi (or similar SBC) with SPI enabled
+- Any Linux machine with USB (using [it8951-usb](https://github.com/evnchn-utilities/it8951-usb)), or Raspberry Pi with SPI
 - IT8951-based e-paper HAT (tested with 9.7" 1448x1072 color panel from [Good Display](https://www.good-display.com/product/365.html))
+- For USB mode: IT8951 HAT dip switch set to **I80** (not SPI)
 - Color panel has RGB subpixel columns in the pattern `RBG / GRB / BGR`
 
 ### Panel notes
@@ -60,11 +66,15 @@ The API strictly rejects messages exceeding limits (returns 400). Callers are re
 ### Prerequisites
 
 ```bash
-# On the SBC, create a venv and install dependencies
+# On the host, create a venv and install dependencies
 python3 -m venv /opt/epaper-app
 /opt/epaper-app/bin/pip install nicegui==3.8.0 Pillow numpy
-/opt/epaper-app/bin/pip install git+https://github.com/GregDMeyer/IT8951.git
-/opt/epaper-app/bin/pip install RPi.GPIO
+
+# USB transport (x86/ARM — no GPIO required)
+/opt/epaper-app/bin/pip install git+https://github.com/evnchn-utilities/it8951-usb.git
+
+# OR SPI transport (Raspberry Pi only)
+/opt/epaper-app/bin/pip install git+https://github.com/GregDMeyer/IT8951.git RPi.GPIO
 
 # Install the monospace font
 sudo apt-get install -y fonts-dejavu-core
@@ -107,7 +117,7 @@ Single Python process running NiceGUI (which wraps FastAPI + Uvicorn):
 Agents ──POST──▶  FastAPI REST API             │
                │    │                          │
                │    ▼                          │
-               │  SQLite ◄── NiceGUI dashboard ◄── Phone browser
+               │  SQLite ◄── NiceGUI dashboard ◄── Browser
                │    │                          │
                │    ▼                          │
                │  Pillow render (RGB)          │
@@ -116,7 +126,7 @@ Agents ──POST──▶  FastAPI REST API             │
                │  Subpixel interleave (→gray)  │
                │    │                          │
                │    ▼                          │
-               │  IT8951 SPI → e-paper panel   │
+               │  IT8951 USB/SPI → e-paper     │
                └──────────────────────────────┘
 ```
 
@@ -138,3 +148,7 @@ The R/B channels are swapped to account for 180° panel rotation. This technique
 | `display.py` | Original standalone image display script |
 | `webserver.py` | Original web interface for uploading images |
 | `img/` | Hardware modification reference photos |
+
+## License
+
+MIT
