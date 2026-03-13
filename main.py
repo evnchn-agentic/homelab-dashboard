@@ -26,9 +26,9 @@ from PIL import Image, ImageDraw, ImageFont
 # ---------------------------------------------------------------------------
 
 class MessageIn(BaseModel):
-    sender: str = Field(..., description="Name of the sender (agent name, service, or person).", max_length=50)
-    header: str = Field(..., description="Message header, max 30 visible chars.", max_length=200)
-    body: str = Field("", description="Message body, max 2 lines of 50 visible chars each, separated by \\n. Caller must line-break to fit.", max_length=500)
+    sender: str = Field(..., description="Name of the sender (agent name, service, or person).")
+    header: str = Field(..., description="Short message title.")
+    body: str = Field("", description="Message body. Markdown is supported.")
 
 class MessageOut(BaseModel):
     id: int
@@ -818,21 +818,10 @@ def clear_page():
 # REST API
 # ---------------------------------------------------------------------------
 
-def _validate_message(header: str, body: str) -> str | None:
+def _validate_message(header: str) -> str | None:
     """Return error string if invalid, None if OK."""
     if not header:
         return "header is required"
-    visible = len(strip_ansi(header))
-    if visible > 30:
-        return f"header exceeds 30 visible chars (got {visible})"
-    if body:
-        lines = body.split("\n")
-        if len(lines) > 2:
-            return f"body exceeds 2 lines (got {len(lines)})"
-        for i, line in enumerate(lines):
-            vlen = len(strip_ansi(line))
-            if vlen > 50:
-                return f"body line {i+1} exceeds 50 visible chars (got {vlen}). Caller must line-break to fit."
     return None
 
 
@@ -898,27 +887,12 @@ async def get_message(msg_id: int):
 
 @app.post("/api/message", response_model=CreatedOut, status_code=201,
           summary="Create a new message",
-          description="Post a message to the e-paper display. Header max 30 visible chars, "
-                      "body max 2 lines of 50 visible chars. ANSI escape codes are supported "
-                      "for color and do not count toward char limits.\n\n"
-                      "**Supported ANSI highlight codes (background colors):**\n\n"
-                      "| Code | Highlight | Text Color |\n"
-                      "|------|-----------|------------|\n"
-                      "| `\\033[40m` | Black | White |\n"
-                      "| `\\033[41m` | Red | White |\n"
-                      "| `\\033[42m` | Green | Black |\n"
-                      "| `\\033[43m` | Yellow | Black |\n"
-                      "| `\\033[44m` | Blue | White |\n"
-                      "| `\\033[45m` | Magenta | White |\n"
-                      "| `\\033[46m` | Cyan | Black |\n"
-                      "| `\\033[47m` | White | Black |\n"
-                      "| `\\033[0m` | Reset (no highlight) | Black |\n\n"
-                      "Text is rendered as highlighted (colored background) for maximum "
-                      "e-paper contrast. Text color is automatically chosen (white on dark "
-                      "backgrounds, black on light). Unsupported codes are silently ignored.",
+          description="Post a message to the dashboard. "
+                      "Body supports **Markdown** formatting (headings, lists, code blocks, links, etc.). "
+                      "No character limits — agents are free to post whatever they need.",
           responses={400: {"model": ErrorOut}})
 async def post_message(data: MessageIn):
-    err = _validate_message(data.header, data.body)
+    err = _validate_message(data.header)
     if err:
         return JSONResponse({"error": err}, status_code=400)
 
@@ -940,7 +914,7 @@ async def update_message(msg_id: int, data: MessageIn):
     header = data.header
     body = data.body
 
-    err = _validate_message(header, body)
+    err = _validate_message(header)
     if err:
         return JSONResponse({"error": err}, status_code=400)
 
@@ -1062,35 +1036,36 @@ def dashboard():
     # Full-height two-column layout: content left, avatar right
     ui.add_head_html(f'<style>body {{ background-color: #181819 !important; }}</style>')
 
-    with ui.row().classes('w-full min-h-screen').style('background:#181819'):
-        # Left column — dashboard content
-        with ui.column().classes('flex-1 p-6 gap-4 overflow-y-auto'):
-            with ui.column().classes(
-                'w-full items-center py-8 px-4 mb-6 rounded-2xl '
-                'bg-gradient-to-br from-gray-900 via-gray-900 to-cyan-950 '
-                'border border-cyan-500/30'
-            ):
-                ui.label('Homelab Dashboard').classes('text-4xl font-bold text-cyan-400 tracking-tight')
-                ui.label('Agent Message Board').classes('text-gray-400 text-lg mt-1')
+    # Two-column layout via CSS grid: content left, avatar right
+    # Avatar aspect ratio ~1080:2340, so at 100vh height, width ≈ 46vh
+    ui.add_head_html('''<style>
+    .dashboard-grid {
+        display: grid !important;
+        grid-template-columns: 1fr 46vh;
+        height: 100vh;
+        width: 100vw;
+        overflow: hidden;
+    }
+    .dashboard-grid > div { min-width: 0; min-height: 0; }
+    </style>''')
+    with ui.element('div').classes('dashboard-grid'):
+        # Left — scrollable message content
+        with ui.scroll_area().style('height:100vh;'):
+            with ui.column().classes('w-full p-6 gap-4'):
+                with ui.column().classes(
+                    'w-full items-center py-8 px-4 mb-6 rounded-2xl '
+                    'bg-gradient-to-br from-gray-900 via-gray-900 to-cyan-950 '
+                    'border border-cyan-500/30'
+                ):
+                    ui.label('Homelab Dashboard').classes('text-4xl font-bold text-cyan-400 tracking-tight')
+                    ui.label('Agent Message Board').classes('text-gray-400 text-lg mt-1')
 
-            with ui.row().classes('w-full gap-2 flex-wrap justify-center mb-4'):
-                ui.link('Dashboard', '/dashboard').classes(
-                    'px-4 py-2 rounded-full bg-cyan-950 text-cyan-400 border border-cyan-500/30 '
-                    'hover:bg-cyan-900 hover:border-cyan-400 font-medium text-sm no-underline transition-colors'
-                )
-                ui.link('Settings', '/settings').classes(
-                    'px-4 py-2 rounded-full bg-cyan-950 text-cyan-400 border border-cyan-500/30 '
-                    'hover:bg-cyan-900 hover:border-cyan-400 font-medium text-sm no-underline transition-colors'
-                )
+                messages_container = ui.column().classes('w-full gap-3')
 
-            messages_container = ui.column().classes('w-full gap-3')
-
-        # Right column — avatar image, full height, matching background
-        with ui.column().classes(
-            'w-80 min-h-screen items-center justify-center p-0'
-        ).style('background:#181819'):
-            # Place your avatar at img/avatar.webp (not tracked in git)
-            ui.image('/img/avatar.webp').classes('h-screen object-contain')
+        # Right — avatar
+        ui.image('/img/avatar.webp').style(
+            'height:100vh; width:100%; object-fit:contain; object-position:right top;'
+        ).props('fit=contain no-spinner')
 
     def _fmt_time(iso_str):
         """Format ISO timestamp to a friendly relative/absolute string."""
@@ -1117,7 +1092,7 @@ def dashboard():
         messages_container.clear()
         with messages_container:
             if not messages:
-                with ui.card().classes('w-full p-8 rounded-2xl bg-gray-900 border border-gray-800'):
+                with ui.card().classes('w-full p-8 rounded-2xl bg-gray-900 border border-gray-800 shadow-none'):
                     ui.label('No messages').classes('text-gray-500 italic text-lg text-center')
             else:
                 ui.button('Clear All', on_click=do_clear_all).props(
@@ -1125,20 +1100,19 @@ def dashboard():
                 for msg in messages:
                     sender = msg.get("sender", "") or "unknown"
                     stamp = _fmt_time(msg["created_at"])
-                    with ui.row().classes('w-full items-start gap-2'):
-                        ui.chat_message(
-                            text=msg["header"] + ("\n" + msg["body"] if msg["body"] else ""),
-                            name=sender,
-                            stamp=stamp,
-                        ).classes('flex-1').style(
-                            'border: 1px solid rgba(34, 211, 238, 0.3); '
-                            'border-radius: 12px; '
-                            'background: rgba(8, 51, 68, 0.3); '
-                            'color: #e2e8f0;'
-                        )
-                        ui.button(icon='close',
-                                  on_click=lambda mid=msg["id"]: do_dismiss(mid)
-                                  ).props('flat dense round color=grey-7 size=sm').classes('mt-2')
+                    with ui.card().classes('w-full p-5 rounded-2xl bg-gray-900 shadow-none').style(
+                        'border: 1px solid rgba(34, 211, 238, 0.3); box-shadow: none;'
+                    ):
+                        with ui.row().classes('w-full items-center justify-between mb-2'):
+                            with ui.row().classes('items-center gap-2'):
+                                ui.label(sender).classes('text-cyan-400 font-semibold text-sm')
+                                ui.label(stamp).classes('text-gray-500 text-xs')
+                            ui.button(icon='close',
+                                      on_click=lambda mid=msg["id"]: do_dismiss(mid)
+                                      ).props('flat dense round color=grey-7 size=sm')
+                        ui.label(msg["header"]).classes('text-lg font-bold text-cyan-300')
+                        if msg["body"]:
+                            ui.markdown(msg["body"]).classes('text-gray-300')
 
     def do_dismiss(msg_id):
         dismiss_message(msg_id)
