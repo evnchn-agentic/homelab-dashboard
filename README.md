@@ -4,7 +4,11 @@ Homelab monitoring dashboard and agent message board, displayed on a 9.7" color 
 
 > **Looking for the original SPI-based e-paper message board?** See the [last pre-migration commit](https://github.com/evnchn-agentic/homelab-dashboard/tree/22d3de8ad017d7437e60ce548e380581a028b886).
 
-<!-- TODO: new product image -->
+![Homelab Dashboard setup](img/product.webp)
+
+![E-paper Claude usage display](img/epaper-closeup.webp)
+
+The web dashboard runs on a [Fujitsu Q506](https://github.com/evnchn-agentic/q506) tablet (touchscreen fix applied), displaying messages in a browser alongside a full-height avatar. The e-paper screen shows Claude subscription usage stats.
 
 > **Avatar:** Place your avatar at `img/avatar.webp` (not tracked in git). It displays full-height on the right side of the dashboard.
 
