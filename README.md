@@ -65,6 +65,42 @@ GET    /api/frame             Get last rendered frame as PNG
 
 The API strictly rejects messages exceeding limits (returns 400). Callers are responsible for line-breaking.
 
+## Integrations
+
+### Claude Code — mirror `PushNotification` to the dashboard
+
+Claude Code's built-in `PushNotification` tool pings your terminal (and your phone, when Remote Control is connected). The `PostToolUse` hook in [`integrations/claude-code/`](integrations/claude-code/) forwards that same message to this dashboard, so a single `PushNotification` call lands on phone/terminal **and** the e-paper board — no separate `curl`.
+
+Two channels, picked by loudness:
+
+| Path | How | Lands on |
+|---|---|---|
+| **Loud** (interrupt-worthy) | `PushNotification` tool → hook | phone/terminal **+** dashboard |
+| **Quiet** (frequent, glanceable) | `POST /api/message` directly | dashboard only |
+
+Install on each machine that runs Claude Code:
+
+```bash
+mkdir -p ~/.claude/hooks
+cp integrations/claude-code/pushnotification-to-dashboard.py ~/.claude/hooks/
+chmod +x ~/.claude/hooks/pushnotification-to-dashboard.py
+```
+
+Then merge [`integrations/claude-code/settings.snippet.json`](integrations/claude-code/settings.snippet.json) into `~/.claude/settings.json` (under `hooks.PostToolUse`) and restart Claude Code.
+
+Optional configuration via environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `EPAPER_DASHBOARD_URL` | `http://192.168.50.73:8090` | dashboard base URL |
+| `EPAPER_DASHBOARD_SENDER` | `Claude Code @ <hostname>` | sender label on the card |
+
+Notes:
+
+- **Fail-safe** — the hook never blocks or fails a session. If the dashboard is unreachable it logs to stderr and exits 0.
+- **Reachability** — the machine running Claude Code must be able to reach the dashboard (same LAN, or via a tunnel — point `EPAPER_DASHBOARD_URL` at it).
+- The full notification text is sent as the message `header`; this deployment stores it verbatim. A build that still enforces the legacy e-paper length limits (see [API](#api)) may reject long messages — the hook logs and moves on.
+
 ## Deployment
 
 ### Prerequisites
