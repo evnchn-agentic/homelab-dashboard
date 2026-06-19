@@ -1,0 +1,16 @@
+{
+  "//": "Merge this into ~/.claude/settings.json. Copy pushnotification-to-dashboard.py to ~/.claude/hooks/ first (see README), or point the command at an absolute path to the script. Set EPAPER_DASHBOARD_URL if your dashboard is not at 192.168.50.73:8090.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "PushNotification",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/pushnotification-to-dashboard.py"
+          }
+        ]
+      }
+    ]
+  }
+}
